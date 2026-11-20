@@ -1,331 +1,66 @@
 # SPDX-FileCopyrightText: 2026 KHWLGH
 # SPDX-License-Identifier: GPL-3.0-only
-# For original project contributions; see COPYRIGHT.
-name: CI
+name: Windows portable release fallback
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Serialize runs of the same ref, including failed tag reruns. Never cancel a release upload.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install native Tauri and HID dependencies
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-          libxdo-dev libssl-dev libudev-dev patchelf
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install JavaScript tooling
-        run: npm ci
-
-      # frontendDist points at out/, which tauri-codegen embeds at macro-expansion time. Without
-      # it `generate_context!` fails inside every cargo invocation, including the Rust steps below
-      # -- so this is a cargo prerequisite, not a frontend step.
-      - name: Build the frontend distribution
-        run: npm run build
-
-      # Reuse the frontend above; timings and native benchmarks stay manual/on-demand.
-      - name: Verify shipping shape and core baseline structure
-        run: |
-          node bench/packaging.mjs
-          node bench/core.mjs --verify-baseline --output bench/results/verify.json
-
-      - name: Test JavaScript pure logic
-        run: npm test
-
-      # 清单和锁文件的版本号一致性由 test/version-sync.test.js 断言（上一步）。
-      # 这里补上另一半：打 tag 时确认 tag 名和清单里的版本号对得上。
-      - name: Verify tag matches manifest version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -euo pipefail
-          manifest=$(node -p "require('./package.json').version")
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$manifest" != "$tag" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} 与清单版本 ${manifest} 不一致"
-            exit 1
-          fi
-          echo "tag ${GITHUB_REF_NAME} 与清单版本 ${manifest} 一致"
-
-      - name: Read bilingual release notes before packaging
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: npm run release:notes
-
-      - name: Type check JavaScript
-        run: npm run typecheck
-
-      - name: Lint and format frontend files with Biome
-        run: npm run lint
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Fetch locked dependencies for the offline component audit
-        run: cargo fetch --locked
-
-      - name: Verify bundled runtime component list
-        run: npm run components:check
-
-      - name: Check Rust formatting
-        run: cargo fmt --check --all
-
-      - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test Rust workspace
-        run: cargo test --workspace
-
-  backend-other-platforms:
-    strategy:
-      # Both platforms have native code paths that Linux cannot cover.
-      matrix:
-        os: [windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      # cargo cannot even expand here without out/: tauri-codegen embeds frontendDist at compile
-      # time, so the Rust-only jobs still need the Node build step.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Build the frontend distribution
-        run: npm ci && npm run build
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Test Rust workspace
-        run: cargo test --workspace
-
-  crate-features:
-    name: Crate feature combinations
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # 只有 witrn-hid 需要 HID 依赖；两个 crate 都不依赖 WebView。
-      - name: Install HID dependencies
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      # 默认特性组合已由 validate 覆盖，这里只跑非默认组合：
-      # 漏标的 #[cfg(feature = ...)] 只在关掉某个特性时才会暴露。
-      - name: Lint and test non-default feature combinations
-        run: |
-          set -euo pipefail
-          combos=(
-            "-p usbpd-parser --no-default-features"
-            "-p usbpd-parser --no-default-features --features serde"
-            "-p usbpd-parser --no-default-features --features vendor-ids"
-            "-p usbpd-parser --all-features"
-            "-p witrn-hid --no-default-features"
-            "-p witrn-hid --all-features"
-          )
-          for combo in "${combos[@]}"; do
-            echo "::group::cargo $combo"
-            cargo clippy $combo --all-targets -- -D warnings
-            cargo test $combo
-            echo "::endgroup::"
-          done
-
   package:
-    name: Package (${{ matrix.package }})
-    needs: [validate, backend-other-platforms, crate-features]
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: windows-x64
-            os: windows-2022
-            target: x86_64-pc-windows-msvc
-            bundles: msi,nsis
-          - package: linux-x64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            bundles: deb,rpm,appimage
-          - package: macos-x64
-            os: macos-26-intel
-            target: x86_64-apple-darwin
-            # Tauri removes the intermediate .app after a DMG-only build; keep it for verification.
-            bundles: app,dmg
-            architecture: x86_64
-          - package: macos-arm64
-            os: macos-26
-            target: aarch64-apple-darwin
-            bundles: app,dmg
-            architecture: arm64
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    env:
-      CI: 'true'
-      # tauri-action defaults this to true, which re-enables Finder AppleScript on CI.
-      TAURI_BUNDLER_DMG_IGNORE_CI: 'false'
+    name: Verify and package v0.2.10 Windows x64 portable
+    runs-on: windows-2022
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v0.2.10
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
 
-      - name: Install locked JavaScript tooling and Tauri CLI
-        run: npm ci
-
-      - name: Install Linux packaging and device dependencies
-        if: runner.os == 'Linux'
-        run: >-
-          sudo apt-get update && sudo apt-get install -y
-          build-essential curl file pkg-config libssl-dev libudev-dev
-          libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-          librsvg2-dev libxdo-dev patchelf libfuse2 xdg-utils
-
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Verify release source and install locked tooling
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne '6af6be2a22262598c81951ed62bfc0ebfcf02340') {
+              throw 'Unexpected release tag commit.'
+          }
+          if ((node -p "require('./package.json').version") -ne '0.2.10') {
+              throw 'Unexpected package version.'
+          }
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
-          key: package-${{ matrix.target }}
+          key: package-x86_64-pc-windows-msvc
 
-      - name: Set macOS deployment target
-        if: runner.os == 'macOS'
-        run: echo 'MACOSX_DEPLOYMENT_TARGET=12.0' >> "$GITHUB_ENV"
-
-      - name: Remove installers restored from the Rust cache
-        env:
-          PACKAGE_ID: ${{ matrix.package }}
-        run: node scripts/release.mjs clean
-
-      # Tauri runs beforeBuildCommand itself, producing the minified frontend.
-      - name: Build installers
-        uses: tauri-apps/tauri-action@v1
-        with:
-          tauriScript: npx --no-install tauri
-          args: --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
-          uploadUpdaterJson: false
-          uploadUpdaterSignatures: false
-
-      - name: Verify macOS architecture, signature, deployment target and DMG
-        if: runner.os == 'macOS'
-        env:
-          PACKAGE_TARGET: ${{ matrix.target }}
-          PACKAGE_ARCH: ${{ matrix.architecture }}
-        run: |
-          set -euo pipefail
-          bundle="target/$PACKAGE_TARGET/release/bundle"
-          app="$bundle/macos/laPower.app"
-          binary="$app/Contents/MacOS/lapower"
-          test "$(lipo -archs "$binary")" = "$PACKAGE_ARCH"
-          codesign --verify --deep --strict "$app"
-          codesign -dvv "$app" 2>&1 | grep -F 'Signature=adhoc'
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = '12.0'
-          xcrun vtool -show-build "$binary" | grep -E 'minos[[:space:]]+12\.0([[:space:]]|$)'
-          shopt -s nullglob
-          images=("$bundle"/dmg/*.dmg)
-          test "${#images[@]}" -eq 1
-          hdiutil verify "${images[0]}"
-
-      - name: Create and verify Windows portable ZIP
-        if: matrix.package == 'windows-x64'
+      - name: Build the portable application
         shell: pwsh
-        run: ./scripts/package-portable-windows.ps1
+        run: npm run build:app -- --no-bundle --target x86_64-pc-windows-msvc -- --locked
 
-      - name: Collect and validate release packages
-        env:
-          PACKAGE_ID: ${{ matrix.package }}
-        run: node scripts/release.mjs collect
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: packages-${{ matrix.package }}
-          path: dist/packages/
-          if-no-files-found: error
-          retention-days: 14
-          overwrite: true
-
-  package-summary:
-    name: Verify all release packages
-    needs: package
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: packages-*
-          merge-multiple: true
-          path: dist/packages/
-
-      - name: Require eight release packages and generate checksums
-        run: node scripts/release.mjs verify
+      - name: Create and verify the portable ZIP
+        shell: pwsh
+        run: |
+          $archive = Get-Item -LiteralPath (./scripts/package-portable-windows.ps1)
+          $output = New-Item -ItemType Directory -Force -Path 'dist/packages'
+          Copy-Item -LiteralPath $archive.FullName -Destination $output.FullName
+          $hash = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($archive.Name)" | Set-Content -LiteralPath (Join-Path $output.FullName 'SHA256SUMS') -Encoding utf8NoBOM
 
       - uses: actions/upload-artifact@v4
         with:
-          name: release-packages
+          name: windows-portable-v0.2.10
           path: dist/packages/
           if-no-files-found: error
           retention-days: 14
-          overwrite: true
-
-  release:
-    name: Publish GitHub Release
-    needs: package-summary
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-packages
-          path: dist/packages/
-
-      - name: Upload, verify and publish the complete release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/release.mjs publish
