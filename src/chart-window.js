@@ -63,7 +63,7 @@ export function zoomTimeWindow(args) {
   const minSpan = Math.max(Number(args.minSpan) || 0, Number.EPSILON);
   let nextSpan = span * factor;
   if (nextSpan < minSpan) nextSpan = minSpan;
-  if (nextSpan > dataSpan) nextSpan = dataSpan;
+  if (nextSpan >= dataSpan) return { min: dataMin, max: dataMax };
 
   let pivot = args.pivot;
   if (!Number.isFinite(pivot)) pivot = (args.min + args.max) / 2;
@@ -84,6 +84,28 @@ export function zoomTimeWindow(args) {
   }
   if (nextMin < dataMin) nextMin = dataMin;
   return { min: nextMin, max: nextMax };
+}
+
+/** Resolve a wheel position against either the overview domain or plot window.
+ * @param {{ratio:number,min:number,max:number,dataMin:number,dataMax:number,overview:boolean}} args
+ */
+export function wheelZoomPivot(args) {
+  const ratio = Math.min(1, Math.max(0, Number.isFinite(args.ratio) ? args.ratio : 0.5));
+  if (args.overview) {
+    const time = args.dataMin + (args.dataMax - args.dataMin) * ratio;
+    return Math.max(args.min, Math.min(args.max, time));
+  }
+  return args.min + (args.max - args.min) * ratio;
+}
+
+/** Classify against the gesture domain, then carry the chosen mode to the current tail.
+ * @param {{min:number,max:number,dataMin:number,dataMax:number,latest:number}} args
+ */
+export function settleWheelZoomWindow(args) {
+  const { min, max, dataMin, dataMax, latest } = args;
+  const window = classifyChartWindow(min, max, dataMin, dataMax, 1e-6);
+  const resolved = resolveChartWindow(window, dataMin, latest);
+  return { min: resolved.min, max: resolved.max };
 }
 
 /**
